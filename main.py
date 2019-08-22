@@ -7,15 +7,16 @@ import pdb
 import torch
 import torch.optim as optim
 import torch.nn as nn
+import torchtext as tt
 
 import generator
 import discriminator
 import helpers
 
 
-CUDA = False
+CUDA = True
 VOCAB_SIZE = 5000
-MAX_SEQ_LEN = 20
+MAX_SEQ_LEN = 30
 START_LETTER = 0
 BATCH_SIZE = 32
 MLE_TRAIN_EPOCHS = 100
@@ -27,11 +28,57 @@ GEN_HIDDEN_DIM = 32
 DIS_EMBEDDING_DIM = 64
 DIS_HIDDEN_DIM = 64
 
-oracle_samples_path = './oracle_samples.trc'
-oracle_state_dict_path = './oracle_EMBDIM32_HIDDENDIM32_VOCAB5000_MAXSEQLEN20.trc'
-pretrained_gen_path = './gen_MLEtrain_EMBDIM32_HIDDENDIM32_VOCAB5000_MAXSEQLEN20.trc'
-pretrained_dis_path = './dis_pretrain_EMBDIM_64_HIDDENDIM64_VOCAB5000_MAXSEQLEN20.trc'
+# oracle_samples_path = './oracle_samples.trc'
+# oracle_state_dict_path = './oracle_EMBDIM32_HIDDENDIM32_VOCAB5000_MAXSEQLEN20.trc'
+# pretrained_gen_path = './gen_MLEtrain_EMBDIM32_HIDDENDIM32_VOCAB5000_MAXSEQLEN20.trc'
+# pretrained_dis_path = './dis_pretrain_EMBDIM_64_HIDDENDIM64_VOCAB5000_MAXSEQLEN20.trc'
 
+src = tt.data.Field(tokenize=tt.data.utils.get_tokenizer("basic_english"),
+                    fix_length=MAX_SEQ_LEN,
+                    lower=True)
+
+dataset = tt.data.TabularDataset(
+    path='jokes.csv', format='csv',
+    fields=[('id', None), ('text', src)])
+
+src.build_vocab(dataset, max_size=VOCAB_SIZE)
+
+src_itr = tt.data.BucketIterator(dataset=dataset,
+                                 batch_size=BATCH_SIZE,
+                                 sort_key=lambda x: len(x.text),
+                                 device=torch.device("cuda:0"))
+
+
+class BatchLoader:
+    def __init__(self, dl, x_field):
+        self.dl, self.x_field = dl, x_field
+
+    def __len__(self):
+        return len(self.dl)
+
+    def __iter__(self):
+        for batch in self.dl:
+            x = getattr(batch, self.x_field)
+            yield x.t()
+
+
+train_loader = BatchLoader(src_itr, 'text')
+
+vocab_max = 0
+for i, batch in enumerate(train_loader):
+    _max = torch.max(batch)
+    if _max > vocab_max:
+        vocab_max = _max
+
+VOCAB_SIZE = vocab_max.item() + 1
+
+inv_vocab = {v: k for k, v in src.vocab.stoi.items()}
+
+# sentence = ['at', 'a', 'dinner', 'party']
+# for w in sentence:
+#     v = src.vocab[w]
+#     print(v)
+#     print(inv_vocab[v])
 
 def train_generator_MLE(gen, gen_opt, oracle, real_data_samples, epochs):
     """
@@ -42,8 +89,8 @@ def train_generator_MLE(gen, gen_opt, oracle, real_data_samples, epochs):
         sys.stdout.flush()
         total_loss = 0
 
-        for i in range(0, POS_NEG_SAMPLES, BATCH_SIZE):
-            inp, target = helpers.prepare_generator_batch(real_data_samples[i:i + BATCH_SIZE], start_letter=START_LETTER,
+        for i, batch in enumerate(real_data_samples):
+            inp, target = helpers.prepare_generator_batch(batch, start_letter=START_LETTER,
                                                           gpu=CUDA)
             gen_opt.zero_grad()
             loss = gen.batchNLLLoss(inp, target)
@@ -65,6 +112,7 @@ def train_generator_MLE(gen, gen_opt, oracle, real_data_samples, epochs):
                                                    start_letter=START_LETTER, gpu=CUDA)
 
         print(' average_train_NLL = %.4f, oracle_sample_NLL = %.4f' % (total_loss, oracle_loss))
+    torch.save(gen, 'netG_MLE.pt')
 
 
 def train_generator_PG(gen, gen_opt, oracle, dis, num_batches):
@@ -88,6 +136,8 @@ def train_generator_PG(gen, gen_opt, oracle, dis, num_batches):
                                                    start_letter=START_LETTER, gpu=CUDA)
 
     print(' oracle_sample_NLL = %.4f' % oracle_loss)
+    torch.save(gen, 'netG_RL.pt')
+    torch.save(dis, 'netD_RL.pt')
 
 
 def train_discriminator(discriminator, dis_opt, real_data_samples, generator, oracle, d_steps, epochs):
@@ -103,15 +153,14 @@ def train_discriminator(discriminator, dis_opt, real_data_samples, generator, or
 
     for d_step in range(d_steps):
         s = helpers.batchwise_sample(generator, POS_NEG_SAMPLES, BATCH_SIZE)
-        dis_inp, dis_target = helpers.prepare_discriminator_data(real_data_samples, s, gpu=CUDA)
         for epoch in range(epochs):
             print('d-step %d epoch %d : ' % (d_step + 1, epoch + 1), end='')
             sys.stdout.flush()
             total_loss = 0
             total_acc = 0
 
-            for i in range(0, 2 * POS_NEG_SAMPLES, BATCH_SIZE):
-                inp, target = dis_inp[i:i + BATCH_SIZE], dis_target[i:i + BATCH_SIZE]
+            for i, batch in enumerate(real_data_samples):
+                inp, target = helpers.prepare_discriminator_data(batch, s, gpu=CUDA)
                 dis_opt.zero_grad()
                 out = discriminator.batchClassify(inp)
                 loss_fn = nn.BCELoss()
@@ -133,12 +182,14 @@ def train_discriminator(discriminator, dis_opt, real_data_samples, generator, or
             val_pred = discriminator.batchClassify(val_inp)
             print(' average_loss = %.4f, train_acc = %.4f, val_acc = %.4f' % (
                 total_loss, total_acc, torch.sum((val_pred>0.5)==(val_target>0.5)).data.item()/200.))
+    torch.save(dis, 'netD_dis.pt')
+
 
 # MAIN
 if __name__ == '__main__':
-    oracle = generator.Generator(GEN_EMBEDDING_DIM, GEN_HIDDEN_DIM, VOCAB_SIZE, MAX_SEQ_LEN, gpu=CUDA)
-    oracle.load_state_dict(torch.load(oracle_state_dict_path))
-    oracle_samples = torch.load(oracle_samples_path).type(torch.LongTensor)
+    oracle = generator.Generator(GEN_EMBEDDING_DIM, GEN_HIDDEN_DIM, VOCAB_SIZE, MAX_SEQ_LEN, gpu=CUDA, oracle_init=True)
+    # oracle.load_state_dict(torch.load(oracle_state_dict_path))
+    # oracle_samples = torch.load(oracle_samples_path).type(torch.LongTensor)
     # a new oracle can be generated by passing oracle_init=True in the generator constructor
     # samples for the new oracle can be generated using helpers.batchwise_sample()
 
@@ -149,12 +200,12 @@ if __name__ == '__main__':
         oracle = oracle.cuda()
         gen = gen.cuda()
         dis = dis.cuda()
-        oracle_samples = oracle_samples.cuda()
+        # oracle_samples = oracle_samples.cuda()
 
     # GENERATOR MLE TRAINING
     print('Starting Generator MLE Training...')
     gen_optimizer = optim.Adam(gen.parameters(), lr=1e-2)
-    train_generator_MLE(gen, gen_optimizer, oracle, oracle_samples, MLE_TRAIN_EPOCHS)
+    train_generator_MLE(gen, gen_optimizer, oracle, train_loader, MLE_TRAIN_EPOCHS)
 
     # torch.save(gen.state_dict(), pretrained_gen_path)
     # gen.load_state_dict(torch.load(pretrained_gen_path))
@@ -162,7 +213,7 @@ if __name__ == '__main__':
     # PRETRAIN DISCRIMINATOR
     print('\nStarting Discriminator Training...')
     dis_optimizer = optim.Adagrad(dis.parameters())
-    train_discriminator(dis, dis_optimizer, oracle_samples, gen, oracle, 50, 3)
+    train_discriminator(dis, dis_optimizer, train_loader, gen, oracle, 50, 3)
 
     # torch.save(dis.state_dict(), pretrained_dis_path)
     # dis.load_state_dict(torch.load(pretrained_dis_path))
@@ -182,4 +233,12 @@ if __name__ == '__main__':
 
         # TRAIN DISCRIMINATOR
         print('\nAdversarial Training Discriminator : ')
-        train_discriminator(dis, dis_optimizer, oracle_samples, gen, oracle, 5, 3)
+        train_discriminator(dis, dis_optimizer, train_loader, gen, oracle, 5, 3)
+        torch.save(gen, 'netG_adv_{}.pt'.format(epoch))
+        torch.save(dis, 'netD_adv_{}.pt'.format(epoch))
+
+    sentences = gen.sample(32)
+    for i in range(sentences.shape[0]):
+        for j in range(sentences.shape[1]):
+            print(inv_vocab[sentences[i][j].item()], end=' ')
+        print('\n')

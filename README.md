@@ -27,3 +27,6 @@ The following hacks (borrowed from https://github.com/soumith/ganhacks) seem to 
 Learning curve obtained after MLE training for 100 epochs followed by adversarial training. (Your results may vary!)
 
 ![alt tag](https://raw.githubusercontent.com/suragnair/seqGAN/master/learning_curve.png)
+
+## Jokes Dataset source
+[https://github.com/taivop/joke-dataset](https://github.com/taivop/joke-dataset)
